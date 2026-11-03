@@ -1,0 +1,7 @@
+/dist/
+/package/RabbitEars/rabbitears
+/package/RabbitEars/data/
+/rabbitears
+/shot.png
+go.work
+go.work.sum

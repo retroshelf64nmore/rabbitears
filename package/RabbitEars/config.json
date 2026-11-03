@@ -1,0 +1,6 @@
+{
+  "label": "Rabbit Ears",
+  "icon": "/mnt/SDCARD/App/RabbitEars/icon.png",
+  "launch": "launch.sh",
+  "description": "A 90s TV: flip through your videos like channels"
+}

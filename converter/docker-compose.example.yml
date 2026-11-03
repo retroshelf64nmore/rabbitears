@@ -1,0 +1,19 @@
+# Add this service to your Pi's docker-compose.yml (or run it on its own).
+# Drop videos (or folders of episodes) into the input folder; VHS-ified copies
+# appear in the output folder, ready to copy into Media/TV on the SD card.
+services:
+  vhsify:
+    build: ./converter          # folder containing this Dockerfile
+    container_name: vhsify
+    restart: unless-stopped
+    user: "1000:1000"           # match the owner of your media folders
+    cpu_shares: 256             # stay out of Plex's way
+    environment:
+      - WEAR=1                  # 0 clean tape … 3 worn-out rental
+      - FIT=letterbox           # or "fill" to crop widescreen to 4:3
+      - SIZE=320x240
+      - PRESET=medium           # "veryfast" on a Pi 3
+      - INTERVAL=60
+    volumes:
+      - /srv/media/tv-drop:/input:ro
+      - /srv/media/tv-vhs:/output

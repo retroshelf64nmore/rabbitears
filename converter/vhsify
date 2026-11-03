@@ -1,0 +1,249 @@
+#!/usr/bin/env bash
+# vhsify — turn any video into a small, VHS-looking file for Rabbit Ears
+# (the 90s TV app for OnionOS on the Miyoo Mini / Mini Plus).
+#
+#   vhsify [options] INPUT... -o OUTDIR
+#
+# INPUT can be video files or folders. A folder is converted recursively and
+# its sub-folders are kept, so a folder of episodes becomes one channel that
+# airs them back to back.
+#
+# Needs ffmpeg + ffprobe 4.4 or newer (Pop!_OS 22.04 and later are fine).
+set -euo pipefail
+
+VERSION=1.0.0
+OUT=""
+FIT=letterbox        # letterbox | fill
+WEAR=1               # 0 clean tape .. 3 worn-out rental
+SIZE=320x240         # 320x240 (fast, authentic) or 640x480
+CRF=24
+PRESET=medium
+FORCE=0
+DRYRUN=0
+TOFILE=""            # --to: exact output path for a single input
+LIMIT=""             # e.g. 30 → only convert the first 30 seconds (for testing)
+QUIET=0
+MIRROR=0             # --mirror: a folder's contents map 1:1 onto OUTDIR
+EXTS="mp4 m4v mkv avi mov wmv flv webm mpg mpeg ts m2ts vob 3gp ogv divx"
+
+usage() {
+  cat <<EOF
+vhsify $VERSION — make videos look and play like a 90s VHS tape on the Miyoo Mini.
+
+Usage: vhsify [options] INPUT... -o OUTDIR
+
+  -o, --out DIR        where to write the converted .mp4 files (required)
+      --mirror         treat an INPUT folder as your whole TV lineup: its files
+                       and sub-folders become channels one-for-one
+                       (default: the folder itself becomes one channel)
+      --fill           crop widescreen video to fill the 4:3 screen
+                       (default: letterbox it with black bars, like a rental)
+      --wear N         tape wear 0-3 (default 1). 0 = clean tape, 3 = worn-out
+                       rental with heavy tracking noise
+      --size WxH       320x240 (default) or 640x480
+      --crf N          x264 quality, lower = better and bigger (default 24)
+      --preset P       x264 speed preset (default medium; use veryfast on a Pi 3)
+      --test SECONDS   only convert the first SECONDS of each video
+  -f, --force          re-convert even if the output already exists
+  -n, --dry-run        show what would be converted
+  -q, --quiet          less output
+  -h, --help           this help
+
+Examples:
+  vhsify ~/Videos/Simpsons -o /media/\$USER/SDCARD/Media/TV       (one channel)
+  vhsify --mirror ~/Videos/TV -o /media/\$USER/SDCARD/Media/TV     (whole lineup)
+  vhsify --fill --wear 2 "Back to the Future.mkv" -o ~/tv
+EOF
+}
+
+die() { echo "vhsify: $*" >&2; exit 1; }
+log() { [ "$QUIET" = 1 ] || echo "$@"; }
+
+INPUTS=()
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -o|--out) OUT="${2:-}"; shift 2 ;;
+    --fill) FIT=fill; shift ;;
+    --letterbox) FIT=letterbox; shift ;;
+    --wear) WEAR="${2:-}"; shift 2 ;;
+    --size) SIZE="${2:-}"; shift 2 ;;
+    --crf) CRF="${2:-}"; shift 2 ;;
+    --preset) PRESET="${2:-}"; shift 2 ;;
+    --test) LIMIT="${2:-}"; shift 2 ;;
+    --to) TOFILE="${2:-}"; shift 2 ;;
+    -f|--force) FORCE=1; shift ;;
+    -n|--dry-run) DRYRUN=1; shift ;;
+    -q|--quiet) QUIET=1; shift ;;
+    --mirror) MIRROR=1; shift ;;
+    -h|--help) usage; exit 0 ;;
+    --version) echo "$VERSION"; exit 0 ;;
+    --) shift; INPUTS+=("$@"); break ;;
+    -*) die "unknown option $1 (see --help)" ;;
+    *) INPUTS+=("$1"); shift ;;
+  esac
+done
+
+[ ${#INPUTS[@]} -gt 0 ] || { usage; exit 1; }
+if [ -n "$TOFILE" ]; then
+  [ ${#INPUTS[@]} -eq 1 ] && [ -f "${INPUTS[0]}" ] || die "--to takes exactly one input file"
+  OUT="$(dirname "$TOFILE")"
+fi
+[ -n "$OUT" ] || die "say where to put the files with -o DIR"
+case "$WEAR" in 0|1|2|3) ;; *) die "--wear must be 0, 1, 2 or 3" ;; esac
+case "$SIZE" in 320x240|640x480) ;; *) die "--size must be 320x240 or 640x480" ;; esac
+command -v ffmpeg >/dev/null || die "ffmpeg is not installed (sudo apt install ffmpeg)"
+command -v ffprobe >/dev/null || die "ffprobe is not installed (sudo apt install ffmpeg)"
+FILTERS=$(ffmpeg -hide_banner -filters 2>/dev/null || true)
+[[ "$FILTERS" == *" chromashift "* ]] || die "your ffmpeg is too old; vhsify needs 4.4 or newer"
+
+W=${SIZE%x*}
+H=${SIZE#*x}
+S=$(( W / 320 ))                 # 1 at 320x240, 2 at 640x480
+
+# ---------------------------------------------------------------------------
+# The look. Everything is baked in here so the Mini only has to decode a
+# small file — it never runs a VHS filter itself.
+#
+#   1. fit to 4:3 (letterbox or crop)
+#   2. smear luma horizontally (VHS resolves ~240 lines across the screen)
+#   3. blur and shift the colour to the right (VHS colour is ~40 lines wide
+#      and bleeds sideways)
+#   4. lift the blacks, warm and over-saturate a little, soften contrast
+#   5. edge-enhance halos (every VCR's "sharpness" circuit)
+#   6. grain, plus head-switching noise jittering along the bottom lines
+#   7. optional tracking glitches that roll through every so often
+# ---------------------------------------------------------------------------
+build_filter() {
+  local fps="$1" g
+  if [ "$FIT" = fill ]; then
+    g="scale=${W}:${H}:force_original_aspect_ratio=increase:flags=bicubic,crop=${W}:${H}"
+  else
+    g="scale=${W}:${H}:force_original_aspect_ratio=decrease:flags=area,pad=${W}:${H}:(ow-iw)/2:(oh-ih)/2:black"
+  fi
+  g="$g,setsar=1"
+  [ -n "$fps" ] && g="$g,fps=${fps}"
+  local soft=$(( W * 5 / 8 ))
+  local noise=$(( 5 + WEAR * 2 ))
+  local cnoise=$(( 3 + WEAR ))
+  local sat chroma
+  case "$WEAR" in 0) sat=1.15; chroma=3 ;; 1) sat=1.22; chroma=4 ;; 2) sat=1.28; chroma=5 ;; *) sat=1.32; chroma=6 ;; esac
+  g="$g,scale=${soft}:${H}:flags=bilinear,scale=${W}:${H}:flags=bicubic"
+  g="$g,format=yuv420p"
+  g="$g,boxblur=luma_radius=0:luma_power=0:chroma_radius=$(( chroma * S )):chroma_power=1"
+  g="$g,chromashift=cbh=$(( 2 * S )):crh=$(( 3 * S )):cbv=0:crv=0"
+  g="$g,eq=contrast=0.90:brightness=0.035:saturation=${sat}:gamma=1.04"
+  g="$g,colorbalance=rs=0.03:gs=0.0:bs=-0.04:rm=0.02:bm=-0.02"
+  g="$g,unsharp=lx=5:ly=3:la=0.9:cx=3:cy=3:ca=0"
+  g="$g,noise=c0s=${noise}:c0f=t+u:c1s=${cnoise}:c1f=t:c2s=${cnoise}:c2f=t"
+
+  # head-switching noise: the bottom few lines tear and jitter sideways
+  local hs=$(( (3 + WEAR) * S ))
+  g="$g,split=3[base][hsw][trk]"
+  g="$g;[hsw]crop=iw:${hs}:0:ih-${hs},noise=c0s=45:c0f=t,lutyuv=y=val*0.85[hsn]"
+  g="$g;[base][hsn]overlay=x='-$(( 4 * S ))-random(0)*$(( (2 + WEAR * 2) * S ))':y=H-h:eval=frame[hsd]"
+
+  # tracking: a band of snow that rolls up the screen now and then
+  if [ "$WEAR" -ge 1 ]; then
+    local period dur band
+    case "$WEAR" in 1) period=97; dur=0.5 ;; 2) period=41; dur=0.9 ;; *) period=17; dur=1.6 ;; esac
+    band=$(( (4 + WEAR * 3) * S ))
+    g="$g;[trk]crop=iw:${band}:0:0,lutyuv=y=170:u=128:v=128,noise=c0s=90:c0f=t[band]"
+    g="$g;[hsd][band]overlay=x='-random(0)*$(( 6 * S ))':y='H-mod(t,${period})/${dur}*(H+h)':enable='lt(mod(t,${period}),${dur})':eval=frame,format=yuv420p[v]"
+  else
+    g="$g;[trk]nullsink;[hsd]format=yuv420p[v]"
+  fi
+  printf '%s' "$g"
+}
+
+# Audio: mono, VHS linear-track bandwidth, gentle compression, faint hiss.
+build_audio() {
+  local hiss
+  case "$WEAR" in 0) hiss=0.0015 ;; 1) hiss=0.003 ;; 2) hiss=0.005 ;; *) hiss=0.008 ;; esac
+  printf 'aresample=32000,pan=mono|c0=0.5*c0+0.5*c1,highpass=f=70,lowpass=f=10000,acompressor=threshold=0.125:ratio=3:attack=20:release=250:makeup=1.6,aeval=val(0)+%s*(random(0)*2-1):c=same,alimiter=limit=0.95' "$hiss"
+}
+
+probe_fps() {
+  local r
+  r=$(ffprobe -v error -select_streams v:0 -show_entries stream=avg_frame_rate -of default=nw=1:nk=1 "$1" 2>/dev/null | head -1)
+  [ -n "$r" ] && [ "$r" != "0/0" ] || { echo ""; return; }
+  # anything above 30 fps (60 fps YouTube rips, etc.) drops to 29.97
+  awk -v r="$r" 'BEGIN{split(r,a,"/"); f=(a[2]>0)?a[1]/a[2]:a[1]; if (f>30.5) print "30000/1001"; else print ""}'
+}
+
+has_audio() {
+  [ -n "$(ffprobe -v error -select_streams a:0 -show_entries stream=index -of csv=p=0 "$1" 2>/dev/null | head -1)" ]
+}
+
+convert_one() {
+  local in="$1" out="$2" fps vf af tmp keyint
+  if [ "$FORCE" = 0 ] && [ -s "$out" ] && [ "$out" -nt "$in" ]; then
+    log "  skip  $out (already converted)"
+    return 0
+  fi
+  if [ "$DRYRUN" = 1 ]; then log "  would convert  $in  →  $out"; return 0; fi
+  mkdir -p "$(dirname "$out")"
+  fps=$(probe_fps "$in")
+  vf=$(build_filter "$fps")
+  keyint=30   # one keyframe a second: channel changes land fast
+  tmp="${out%.mp4}.part.mp4"
+  local args=(-hide_banner -nostdin -y)
+  [ "$QUIET" = 1 ] && args+=(-loglevel error) || args+=(-loglevel error -stats)
+  args+=(-i "$in")
+  [ -n "$LIMIT" ] && args+=(-t "$LIMIT")
+  args+=(-filter_complex "[0:v:0]${vf}" -map "[v]")
+  if has_audio "$in"; then
+    af=$(build_audio)
+    args+=(-map 0:a:0 -af "$af" -c:a aac -b:a 64k -ac 1)
+  else
+    args+=(-an)
+  fi
+  args+=(-c:v libx264 -profile:v baseline -level 3.0 -pix_fmt yuv420p
+         -preset "$PRESET" -tune fastdecode -crf "$CRF"
+         -maxrate $(( 700 * S * S ))k -bufsize $(( 1400 * S * S ))k
+         -x264-params "keyint=${keyint}:min-keyint=10:scenecut=40"
+         -map_metadata -1 -map_chapters -1 -sn -dn
+         -movflags +faststart -f mp4 "$tmp")
+  log "  ▶ $in"
+  if ffmpeg "${args[@]}"; then
+    mv -f "$tmp" "$out"
+    log "  ✔ $out ($(du -h "$out" | cut -f1))"
+  else
+    rm -f "$tmp"
+    echo "  ✘ failed: $in" >&2
+    return 1
+  fi
+}
+
+is_video() {
+  local ext="${1##*.}"; ext="${ext,,}"
+  [[ " $EXTS " == *" $ext "* ]]
+}
+
+FAILED=0
+mkdir -p "$OUT" 2>/dev/null || [ "$DRYRUN" = 1 ] || die "can't create $OUT"
+for src in "${INPUTS[@]}"; do
+  if [ -d "$src" ]; then
+    base="$(basename "$(cd "$src" && pwd)")"
+    log "Folder: $src"
+    while IFS= read -r -d '' f; do
+      rel="${f#"$src"/}"
+      case "$(basename "$rel")" in .*|*.part.mp4) continue ;; esac
+      is_video "$f" || continue
+      # the folder becomes one channel that airs its videos in order
+      if [ "$MIRROR" = 1 ]; then dest="$OUT/${rel%.*}.mp4"; else dest="$OUT/$base/${rel%.*}.mp4"; fi
+      convert_one "$f" "$dest" || FAILED=$((FAILED+1))
+    done < <(find "$src" -type f -print0 | sort -z)
+  elif [ -f "$src" ] && [ -n "$TOFILE" ]; then
+    convert_one "$src" "$TOFILE" || FAILED=$((FAILED+1))
+  elif [ -f "$src" ]; then
+    is_video "$src" || { echo "  skip $src (not a video file I know)" >&2; continue; }
+    name="$(basename "$src")"
+    convert_one "$src" "$OUT/${name%.*}.mp4" || FAILED=$((FAILED+1))
+  else
+    echo "  skip $src (not found)" >&2
+    FAILED=$((FAILED+1))
+  fi
+done
+
+[ "$FAILED" = 0 ] || { echo "vhsify: $FAILED file(s) failed" >&2; exit 1; }
+[ -n "$TOFILE" ] || log "Done. Copy the contents of $OUT into Media/TV on your SD card."
